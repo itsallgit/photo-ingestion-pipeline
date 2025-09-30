@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Photo Ingestion Pipeline - Wave 1</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:#f7fafc; color:#111827; margin:0; padding:0; }
+    .app { max-width:1100px; margin:24px auto; background:white; border-radius:8px; box-shadow:0 4px 20px rgba(0,0,0,0.06); padding:20px; }
+    input[type="text"], textarea { width:100%; padding:8px; border:1px solid #e5e7eb; border-radius:6px; }
+    button { background:#2563eb; color:white; padding:8px 12px; border:0; border-radius:6px; cursor:pointer; }
+    button.secondary { background:#6b7280; }
+    .grid { display:grid; grid-template-columns: 1fr 320px; gap:16px; }
+    .card { background:#fff; padding:12px; border-radius:6px; border:1px solid #e6eef8; }
+    .folder-row { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+    label.tag { background:#eef2ff; padding:4px 8px; border-radius:999px; }
+    pre.log { background:#0f172a; color:#e6eef8; padding:8px; height:250px; overflow:auto; border-radius:6px; }
+    .small { font-size:13px; color:#6b7280; }
+  </style>
+</head>
+<body>
+<div id="app" class="app">
+  <h2>Photo Ingestion Pipeline — Wave 1 (MVP)</h2>
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h3>Create session</h3>
+        <p class="small">Enter the path to the temporary folder you copied photos into (path inside the container).</p>
+        <input v-model="source" placeholder="/data/incoming" />
+        <div style="margin-top:8px;">
+          <button @click="scan">Scan folders</button>
+          <button class="secondary" @click="refreshSessions" style="margin-left:8px">Refresh Sessions</button>
+        </div>
+        <div v-if="scanned" style="margin-top:12px;">
+          <h4>Folders found</h4>
+          <div v-for="(info, rel) in subfolders" :key="rel" class="folder-row">
+            <div style="flex:1">
+              <strong>{{ rel || '(root)' }}</strong>
+              <div class="small">Photos: {{ info.photo_count }}, Files: {{ info.file_count }}</div>
+            </div>
+            <div style="width:320px">
+              <input v-model="mappings[rel]" placeholder="custom tags (comma separated)" />
+            </div>
+          </div>
+          <div style="margin-top:8px;">
+            <button @click="createSession">Create Session</button>
+            <span class="small" style="margin-left:8px">Note: If you leave all tags empty, Wave 1 will auto-complete and do nothing.</span>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="currentSession" class="card" style="margin-top:12px;">
+        <h3>Current session: {{ currentSession.session_id }}</h3>
+        <div class="small">Status: {{ currentSession.status }}</div>
+        <div style="margin-top:8px;">
+          <button @click="startSession">Start Ingestion (Wave 1)</button>
+          <button class="secondary" @click="stopSession" style="margin-left:8px">Stop</button>
+        </div>
+        <div style="margin-top:12px;">
+          <h4>Session files</h4>
+          <div v-if="files">
+            <div v-for="f in files" :key="f.path" style="border-bottom:1px dashed #e5e7eb; padding:6px 0;">
+              <div><strong>{{ f.path.replace(currentSession.source_folder, '') }}</strong></div>
+              <div class="small">Photo: {{ f.is_photo }} | Waves: {{ f.waves_completed.join(', ') || '-' }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div>
+      <div class="card">
+        <h3>Live log</h3>
+        <pre class="log">{{ logText }}</pre>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h3>Sessions</h3>
+        <div v-for="s in sessions" :key="s.session_id" style="padding:6px 0; border-bottom:1px dashed #eef2ff;">
+          <div><strong @click="loadSession(s)">{{ s.session_id }}</strong></div>
+          <div class="small">Created: {{ s.created_at }} | Photos: {{ s.summary.photos_count }}</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h3>Global tags</h3>
+        <div v-if="tags">
+          <div v-for="(count, tag) in tags" :key="tag" style="display:flex; justify-content:space-between; padding:4px 0;">
+            <div>#{{ tag }}</div>
+            <div class="small">{{ count }}</div>
+          </div>
+          <div style="margin-top:8px;">
+            <button @click="exportTags">Export tags.json</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+const { createApp, ref, reactive } = Vue;
+createApp({
+  data() {
+    return {
+      source: "/app/data/incoming",
+      scanned: false,
+      subfolders: {},
+      mappings: {},
+      currentSession: null,
+      sessions: [],
+      files: null,
+      logText: "",
+      ws: null,
+      tags: null
+    }
+  },
+  mounted() {
+    this.refreshSessions();
+    this.loadTags();
+  },
+  methods: {
+    async scan() {
+      this.scanned = false;
+      this.subfolders = {};
+      this.mappings = {};
+      try {
+        const res = await fetch(`/api/subfolders?source=${encodeURIComponent(this.source)}`);
+        if (!res.ok) {
+          alert("Scan failed: " + (await res.text()));
+          return;
+        }
+        const data = await res.json();
+        this.subfolders = data.subfolders || {};
+        // initialize mapping keys
+        for (const k in this.subfolders) {
+          this.mappings[k] = "";
+        }
+        this.scanned = true;
+      } catch (err) {
+        alert("Scan error: " + err);
+      }
+    },
+    async createSession() {
+      // gather mappings: split by comma and trim
+      const fm = {};
+      for (const k in this.mappings) {
+        const raw = this.mappings[k] || "";
+        const arr = raw.split(",").map(s => s.trim()).filter(s => s);
+        fm[k] = arr;
+      }
+      const payload = { source_folder: this.source, folder_mappings: fm, config: {} };
+      const res = await fetch("/api/sessions", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload) });
+      if (!res.ok) {
+        alert("Create session failed: " + (await res.text()));
+        return;
+      }
+      const data = await res.json();
+      this.currentSession = data;
+      this.loadSessionFiles();
+      this.refreshSessions();
+      this.startWs();
+    },
+    async refreshSessions() {
+      const res = await fetch("/api/sessions");
+      this.sessions = await res.json();
+    },
+    async loadSessionFiles() {
+      if (!this.currentSession) return;
+      const res = await fetch(`/api/sessions/${this.currentSession.session_id}/files`);
+      if (res.ok) {
+        this.files = await res.json();
+      }
+    },
+    async startSession() {
+      if (!this.currentSession) {
+        alert("No session loaded");
+        return;
+      }
+      const res = await fetch(`/api/sessions/${this.currentSession.session_id}/start`, { method:"POST" });
+      if (!res.ok) {
+        alert("Start failed: " + (await res.text()));
+        return;
+      }
+      this.appendLog("Started session");
+      this.startWs();
+      setTimeout(()=>this.loadSessionFiles(), 1500);
+    },
+    async stopSession() {
+      if (!this.currentSession) return;
+      await fetch(`/api/sessions/${this.currentSession.session_id}/stop`, { method:"POST" });
+      this.appendLog("Stop requested");
+    },
+    startWs() {
+      if (!this.currentSession) return;
+      if (this.ws) {
+        try { this.ws.close(); } catch(e) {}
+      }
+      const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/sessions/${this.currentSession.session_id}/ws`;
+      this.ws = new WebSocket(url);
+      this.ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type === 'log') {
+            this.appendLog(data.text);
+          } else if (data.type === 'file_processed') {
+            this.appendLog(`Processed ${data.path}: tags=${(data.tags_added||[]).join(',')}`);
+          } else if (data.type === 'wave_complete') {
+            this.appendLog(`Wave complete: ${data.wave}`);
+            this.loadSessionFiles();
+            this.refreshSessions();
+            this.loadTags();
+          } else if (data.type === 'file_skipped') {
+            // ignore
+          } else {
+            this.appendLog(JSON.stringify(data));
+          }
+        } catch(e) {
+          this.appendLog("WS parse error: "+e);
+        }
+      };
+      this.ws.onopen = () => { this.appendLog("WS connected"); }
+      this.ws.onclose = () => { this.appendLog("WS closed"); }
+    },
+    appendLog(s) {
+      const ts = new Date().toISOString();
+      this.logText = `[${ts}] ${s}\n` + this.logText;
+    },
+    async loadSession(s) {
+      this.currentSession = s;
+      await this.loadSessionFiles();
+      this.startWs();
+    },
+    async loadTags() {
+      const r = await fetch("/api/tags");
+      if (r.ok) {
+        const d = await r.json();
+        this.tags = d.tags || {};
+      }
+    },
+    exportTags() {
+      const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(this.tags, null, 2));
+      const a = document.createElement('a');
+      a.setAttribute('href', dataStr);
+      a.setAttribute('download', 'tags.json');
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  }
+}).mount('#app')
+</script>
+</body>
+</html>
