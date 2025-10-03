@@ -1,4 +1,4 @@
-version: '3.8'
+
 services:
   photo-ingestion-pipeline:
     container_name: photo-ingestion-pipeline
@@ -8,5 +8,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ../data:/app/data
+      - ./data:/app/data  # Host data directory is mounted to container
+      - ../INGESTION_TARGET:/app/INGESTION_TARGET  # Host INGESTION_TARGET directory is mounted to container
     restart: unless-stopped

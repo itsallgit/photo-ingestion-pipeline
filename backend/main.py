@@ -284,101 +284,130 @@ def wave1_worker(session_id: str):
         send_ws_event(session_id, {"type":"wave_complete", "wave":"wave1"})
         append_log(session_id, "Wave 1 auto-complete done")
         return
-    
-    # Else process files
-    total = sum(1 for f in files if f["is_photo"])
-    processed = 0
-    all_new_tags = []
 
-    for idx, f in enumerate(files):
+    # Group files by folder for batch processing
+    folder_files = {}
+    for f in files:
         if not f["is_photo"]:
             continue
         if "wave1" in f["waves_completed"]:
-            processed += 1
-            send_ws_event(session_id, {"type":"file_skipped", "path": f["path"], "reason": "already_completed"})
             continue
-        # Determine tags from folder mapping
-        rel_dir = f.get("rel_dir","")
+        rel_dir = f.get("rel_dir", "")
+        folder_files.setdefault(rel_dir, []).append(f)
+
+    # Process each folder that has mappings
+    all_new_tags = []
+    total_files = sum(len(files) for files in folder_files.values())
+    processed_files = 0
+
+    for folder, folder_batch in folder_files.items():
+        # Skip folders without mappings
+        if not folder_batch:
+            continue
+
+        # Find tags for this folder
         tags = []
-        # The mapping keys may be "", ".", or folder names; match exact rel_dir or parent paths
-        if rel_dir in folder_mappings and folder_mappings[rel_dir]:
-            tags = folder_mappings[rel_dir]
+        if folder in folder_mappings and folder_mappings[folder]:
+            tags = folder_mappings[folder]
         else:
             # try to find mapping for a parent folder path
-            # find longest matching mapping key
             best = ""
             for k in folder_mappings.keys():
                 if k == "":
                     continue
-                if rel_dir == k or rel_dir.startswith(k + os.sep) or rel_dir.startswith(k + "/"):
+                if folder == k or folder.startswith(k + os.sep) or folder.startswith(k + "/"):
                     if len(k) > len(best):
                         best = k
             if best and folder_mappings.get(best):
                 tags = folder_mappings.get(best, [])
+
         # normalize tags
         tags_norm = [normalize_tag(t) for t in tags if t and normalize_tag(t)]
-        new_tags = []
+        
         if not tags_norm:
-            # no tags for this file; still mark wave1 done
-            f["waves_completed"].append("wave1")
-            f["last_processed"] = datetime.datetime.utcnow().isoformat() + "Z"
-            append_log(session_id, f"No custom tags for {f['path']}; marked wave1 complete")
-            processed += 1
-            send_ws_event(session_id, {"type":"file_processed", "path": f["path"], "tags_added": [], "wave":"wave1"})
+            # No tags for this folder, mark all files complete
+            for f in folder_batch:
+                if "wave1" not in f["waves_completed"]:
+                    f["waves_completed"].append("wave1")
+                    f["last_processed"] = datetime.datetime.utcnow().isoformat() + "Z"
+                processed_files += 1
             continue
-        # Read existing keywords
-        try:
-            existing = run_exiftool_read_keywords(f["path"])
-        except Exception as e:
-            err = f"Failed reading keywords for {f['path']}: {str(e)}"
-            f["errors"].append(err)
-            append_log(session_id, err)
-            write_json_atomic(session_files_file, files)
-            continue
-        existing_norm = [normalize_tag(x) for x in existing if x and normalize_tag(x)]
-        # Determine new tags to add
-        new_tags = []
-        for t in tags_norm:
-            if t not in existing_norm:
-                new_tags.append(t)
-        merged = sorted(set(existing_norm + new_tags))
-        # Write keywords if any change
-        if set(merged) != set(existing_norm):
+
+        # Get existing tags for all files in batch
+        folder_total = len(folder_batch)
+        folder_processed = 0
+        send_ws_event(session_id, {
+            "type": "folder_progress",
+            "folder": folder,
+            "total": folder_total,
+            "processed": folder_processed
+        })
+
+        # Process batch
+        for f in folder_batch:
+            # Check if we should stop
+            session_meta = read_json_file(session_file)
+            if session_meta.get("status") == "stopped":
+                append_log(session_id, "Stop requested, ending processing")
+                return
+
             try:
-                run_exiftool_write_keywords(f["path"], merged)
-                append_log(session_id, f"Wrote {len(new_tags)} tags to {f['path']}: {new_tags}")
+                existing = run_exiftool_read_keywords(f["path"])
             except Exception as e:
-                err = f"Failed writing keywords for {f['path']}: {str(e)}"
+                err = f"Failed reading keywords for {f['path']}: {str(e)}"
                 f["errors"].append(err)
                 append_log(session_id, err)
-                write_json_atomic(session_files_file, files)
                 continue
-        else:
-            append_log(session_id, f"No new tags for {f['path']}")
 
-        # update file entry
-        f["iptc_keywords_before"] = existing_norm
-        f["iptc_keywords_after"] = merged
-        if "wave1" not in f["waves_completed"]:
-            f["waves_completed"].append("wave1")
-        f["sha256"] = None
-        f["last_processed"] = datetime.datetime.utcnow().isoformat() + "Z"
-        all_new_tags.extend(new_tags)
-        processed += 1
-    
+            existing_norm = [normalize_tag(x) for x in existing if x and normalize_tag(x)]
+            new_tags = [t for t in tags_norm if t not in existing_norm]
+            merged = sorted(set(existing_norm + new_tags))
+
+            if set(merged) != set(existing_norm):
+                try:
+                    run_exiftool_write_keywords(f["path"], merged)
+                    append_log(session_id, f"Updated tags for {f['path']}")
+                except Exception as e:
+                    err = f"Failed writing keywords for {f['path']}: {str(e)}"
+                    f["errors"].append(err)
+                    append_log(session_id, err)
+                    continue
+
+            f["iptc_keywords_before"] = existing_norm
+            f["iptc_keywords_after"] = merged
+            if "wave1" not in f["waves_completed"]:
+                f["waves_completed"].append("wave1")
+            f["last_processed"] = datetime.datetime.utcnow().isoformat() + "Z"
+            all_new_tags.extend(new_tags)
+            
+            folder_processed += 1
+            processed_files += 1
+            
+            # Update progress
+            send_ws_event(session_id, {
+                "type": "folder_progress",
+                "folder": folder,
+                "total": folder_total,
+                "processed": folder_processed,
+                "complete": folder_processed >= folder_total
+            })
+
+        # Save progress after each folder
         write_json_atomic(session_files_file, files)
-        processed += 1
-        send_ws_event(session_id, {"type":"file_processed", "path": f["path"], "tags_added": new_tags, "wave":"wave1", "processed": processed, "total": total})
-        time.sleep(0.01)  # small sleep to yield
-    
+
     # Update global tags
     update_global_tags(all_new_tags)
 
     # Mark session completed
     session_meta["status"] = "wave1_completed"
     write_json_atomic(session_file, session_meta)
-    append_log(session_id, f"Wave 1 complete. processed={processed}/{total}")
-    send_ws_event(session_id, {"type":"wave_complete", "wave":"wave1", "processed": processed, "total": total})
+    append_log(session_id, f"Wave 1 complete. Total processed={processed_files}/{total_files}")
+    send_ws_event(session_id, {
+        "type": "wave_complete",
+        "wave": "wave1",
+        "processed": processed_files,
+        "total": total_files
+    })
 
 def update_global_tags(new_tags: List[str]) -> None:
     data = read_json_file(TAGS_FILE) or {"tags": {}, "updated_at": None}
