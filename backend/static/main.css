@@ -1,0 +1,279 @@
+:root {
+  --color-light: #f4f0ff;
+  --color-primary: #5180bb;
+  --color-dark: #0b366b;
+  --color-accent1: #FFB703;
+  --color-accent2: #FB8500;
+  
+  --color-bg: #ffffff;
+  --color-text: #0d003f;
+  --color-muted: #555;
+  --color-border: #e5dcff;
+}
+
+/* =========================================
+   Base Styles
+   ========================================= */
+body {
+  font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+  background: var(--color-bg);
+  color: var(--color-text);
+  margin: 0;
+  padding: 0;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 32px auto;
+  padding: 24px;
+}
+@media (max-width: 900px) {
+  .app {
+    margin: 12px auto;
+    padding: 12px;
+  }
+}
+
+h2 {
+  font-size: 2em;
+  font-weight: 700;
+  margin-bottom: 20px;
+  color: var(--color-text);
+}
+
+h3 {
+  font-size: 1.4em;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+h4 {
+  font-size: 1.1em;
+  font-weight: 500;
+  margin-bottom: 8px;
+  margin-top: 0;
+}
+
+/* =========================================
+   Card
+   ========================================= */
+.card {
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid var(--color-border);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.card h3 {
+  background: var(--color-light);
+  color: var(--color-text);
+  padding: 8px 12px;
+  margin: -16px -16px 16px -16px;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+/* =========================================
+   Layout
+   ========================================= */
+.flex-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.flex-3 { flex: 3; }
+.flex-1 { flex: 1; }
+
+.mt-8 { margin-top: 8px; }
+.mt-12 { margin-top: 12px; }
+.mt-20 { margin-top: 20px; }
+.ml-8 { margin-left: 8px; }
+
+/* =========================================
+   Buttons
+   ========================================= */
+button {
+  background: var(--color-primary);
+  color: #fff;
+  padding: 8px 14px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.95em;
+  font-weight: 500;
+  transition: background 0.2s ease;
+}
+
+button.secondary {
+  background: var(--color-light);
+  color: var(--color-dark);
+}
+
+button:disabled {
+  background: #cbd5e1;
+  cursor: not-allowed;
+}
+
+/* =========================================
+   Sessions
+   ========================================= */
+.session-btn {
+  background: #f1f5f9;
+  color: var(--color-primary);
+  border: none;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.session-btn:hover {
+  background: var(--color-light);
+}
+
+.session-row { padding: 6px 0; }
+.small { font-size: 0.85em; color: var(--color-muted); padding-left: 5px;}
+
+/* =========================================
+   Folder Row + Tag Input
+   ========================================= */
+.folder-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+}
+.folder-row:last-child {
+  border-bottom: none;
+}
+
+.folder-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.folder-name {
+  flex: 1;
+  font-weight: 600;
+}
+.folder-stats {
+  white-space: nowrap;
+  color: var(--color-muted);
+}
+
+.tags-input-container {
+  display: flex;
+  flex-wrap: wrap;
+}
+.tags-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  flex: 1;
+  background: #fff;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 6px;
+  cursor: text;
+}
+
+.tags-input {
+  border: none;
+  outline: none;
+  flex: 1;
+  min-width: 100px;
+  padding: 6px;
+  font-size: 0.9em;
+}
+
+/* Chip style (shared between subfolders and Wave 1) */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-accent2);
+  color: #fff;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.85em;
+  margin: 2px;
+  gap: 6px;
+  line-height: 1;
+  padding-bottom: 6px;
+}
+.chip-remove {
+  font-weight: bold;
+  cursor: pointer;
+}
+.chip-remove:hover {
+  color: var(--color-accent2);
+}
+
+/* =========================================
+   Status Labels
+   ========================================= */
+.status {
+  padding: 6px 12px;
+  border-radius: 6px;
+  display: inline-block;
+  font-weight: 500;
+}
+.status-working { background: var(--color-accent1); color: var(--color-dark); }
+.status-complete { background: #dcfce7; color: var(--color-dark); }
+
+/* =========================================
+   Wave 1 Section
+   ========================================= */
+.wave1 {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.wave1-table { 
+  width: 100%; 
+  border-collapse: collapse; 
+}
+.wave1-table th, .wave1-table td { 
+  padding: 8px; 
+  text-align: left; 
+  border-bottom: 1px solid #eee; 
+}
+.wave1-table th { 
+  background: var(--color-light); 
+  color: var(--color-dark); 
+}
+
+.folder-cell { width: 100%; }
+.tags-cell { white-space: normal; }
+
+/* Pill statuses */
+.status-pill {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.8em;
+  font-weight: 600;
+  color: #fff;
+}
+.pill-complete { background: var(--color-accent2); }
+.pill-working { background: var(--color-accent1); }
+
+/* =========================================
+   Log Viewer
+   ========================================= */
+pre.log {
+  background: var(--color-dark);
+  color: var(--color-light);
+  padding: 10px;
+  border-radius: 6px;
+  height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
