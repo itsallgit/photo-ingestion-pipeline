@@ -1,1 +1,0 @@
-This folder is used by the container to persist sessions, tags and logs.

@@ -84,53 +84,38 @@ If you wish to run the backend directly without Docker:
 
 ## Updating the Application
 
-When working on the application, you'll need different commands depending on what you're updating:
+For any changes (frontend, backend, or dependencies), use this single command from the project root to tear down containers, force a clean image build (no cache), and recreate containers:
 
-### 1. Frontend Changes (HTML/JavaScript/CSS)
-For changes to files in `backend/static/`:
 ```bash
-# Stop the container but keep the volume
-docker-compose -f docker/docker-compose.yml stop
-# Remove the container but keep the volume
-docker rm photo-ingestion-pipeline
-# Rebuild and start, mounting the existing volume
-docker-compose -f docker/docker-compose.yml up --build -d
+docker-compose -f docker/docker-compose.yml down --remove-orphans \
+   && docker-compose -f docker/docker-compose.yml build --no-cache --pull \
+   && docker-compose -f docker/docker-compose.yml up -d --force-recreate --remove-orphans
 ```
 
-### 2. Backend Code Changes (Python)
-For changes to Python files in `backend/`:
+Notes:
+- This ensures COPY layers (including `backend/static/main.css`) reflect your latest files.
+- The `data/` volume is preserved across rebuilds; do not run `docker-compose down -v` unless you want to delete persisted data.
+- If you still see stale assets in the browser after rebuilding, clear your browser cache or hard-reload (Ctrl+Shift+R), and verify the server is serving the updated file:
+
 ```bash
-# Same process as frontend changes
-docker-compose -f docker/docker-compose.yml stop
-docker rm photo-ingestion-pipeline
-docker-compose -f docker/docker-compose.yml up --build -d
+curl -sS http://localhost:8000/ui/main.css | sed -n '1,40p'
 ```
 
-### 3. Dependencies Changes
-When modifying `requirements.txt` or the Dockerfile:
+If the in-container file still appears stale, inspect the file inside the backend container:
+
 ```bash
-# Same process as above, but you might need to pull new base images
-docker-compose -f docker/docker-compose.yml stop
-docker rm photo-ingestion-pipeline
-docker-compose -f docker/docker-compose.yml build --no-cache
-docker-compose -f docker/docker-compose.yml up -d
+docker-compose -f docker/docker-compose.yml exec backend sh -c 'sed -n "1,40p" /app/static/main.css'
 ```
 
-### 4. Data Persistence
-Your data is preserved in these locations:
-- Session data: `data/sessions/`
-- Logs: `data/logs/`
-- Tags: `data/tags.json`
-- Photos: `data/incoming/`
-
-The volume mount in docker-compose.yml (`../data:/app/data`) ensures this data persists between rebuilds.
-
-Important: 
-- Never use `docker-compose down -v` as it will remove volumes
-- Always stop and remove the container before rebuild to ensure clean state
-- Use `-d` flag to run in detached mode (background)
-- Check logs with `docker-compose -f docker/docker-compose.yml logs -f`
+Finally, check `docker-compose.yml` for any host bind-mounts that overlay `/app` inside the container; if a bind-mount exists, the container will serve files directly from your host path (so rebuilding the image won't change what the container serves).
 
 ## Support
 If you encounter issues, check `data/logs/` for session logs, and the container logs via `docker-compose logs backend`.
 
+
+
+## TODO
+- Export global tags working but UI display of tags doesn't show tag key.
+- Wave 1 status per folder not updating correctly.
+- Batch exiftool for folders, currently running image by image (but working).
+- Check log file length mismatch error when starting ingestion.

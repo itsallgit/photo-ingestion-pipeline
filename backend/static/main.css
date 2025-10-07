@@ -1,14 +1,14 @@
 :root {
-  --color-light: #f4f0ff;
+  --color-light: #f5f5f5;
   --color-primary: #5180bb;
   --color-dark: #0b366b;
   --color-accent1: #FFB703;
   --color-accent2: #FB8500;
   
   --color-bg: #ffffff;
-  --color-text: #0d003f;
+  --color-text: #000000;
   --color-muted: #555;
-  --color-border: #e5dcff;
+  --color-border: #e1e1e1;
 }
 
 /* =========================================
@@ -247,7 +247,7 @@ button:disabled {
 }
 .wave1-table th { 
   background: var(--color-light); 
-  color: var(--color-dark); 
+  color: var(--color-text); 
 }
 
 .folder-cell { width: 100%; }

@@ -7,6 +7,7 @@ import time
 import datetime
 import asyncio
 import subprocess
+import traceback
 from typing import List, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -32,9 +33,14 @@ DEFAULT_CONFIG = {
     "geocode_mode": "offline"
 }
 
+import logging
+
 # Globals
 session_queues: Dict[str, asyncio.Queue] = {}
 EVENT_LOOP = None
+
+# per-session logger cache
+session_loggers: Dict[str, logging.Logger] = {}
 app = FastAPI(title="Photo Ingestion Pipeline - Wave 1 (MVP)")
 app.add_middleware(
     CORSMiddleware,
@@ -147,14 +153,85 @@ def write_json_atomic(path: str, data: Any) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
-def append_log(session_id: str, line: str) -> None:
+def get_session_logger(session_id: str) -> logging.Logger:
+    """Return (and create if necessary) a logger that appends to data/logs/<session_id>.log.
+
+    The logger writes human-readable lines produced by structured_log. We cache loggers to
+    avoid adding multiple handlers on repeated calls.
+    """
+    logger = session_loggers.get(session_id)
+    if logger:
+        return logger
+    # create logger
+    logger = logging.getLogger(f"session.{session_id}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # avoid duplicate handlers
+    if not logger.handlers:
+        try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+        except Exception:
+            pass
+        logpath = os.path.join(LOGS_DIR, f"{session_id}.log")
+        try:
+            fh = logging.FileHandler(logpath, mode='a', encoding='utf-8')
+            fh.setLevel(logging.INFO)
+            # message already includes timestamp/level; keep formatter simple
+            fh.setFormatter(logging.Formatter('%(message)s'))
+            logger.addHandler(fh)
+        except Exception:
+            # fallback: do nothing; calls to logger will be no-ops
+            pass
+    session_loggers[session_id] = logger
+    return logger
+
+
+def structured_log(session_id: str, level: str, message: str, meta: Dict[str, Any] = None) -> None:
+    """Write a human-readable log line to the session file (append) and emit a websocket event.
+
+    Log line format: [ISO_TS] [LEVEL] message <meta-as-json-optional>
+    """
     ts = datetime.datetime.utcnow().isoformat() + "Z"
-    log_line = f"[{ts}] {line}\n"
-    logpath = os.path.join(LOGS_DIR, f"{session_id}.log")
-    with open(logpath, "a", encoding='utf-8') as f:
-        f.write(log_line)
-    # also send to websocket if queue exists
-    send_ws_event(session_id, {"type": "log", "text": line, "ts": ts})
+    lvl = (level or "info").upper()
+    line = f"[{ts}] [{lvl}] {message}"
+    if meta:
+        try:
+            line += " " + json.dumps(meta, ensure_ascii=False)
+        except Exception:
+            line += " " + str(meta)
+
+    # write to per-session file using simple append+flush (guaranteed)
+    try:
+        p = os.path.join(LOGS_DIR, f"{session_id}.log")
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write(line + "\n")
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception:
+        # best-effort fallback to logger
+        try:
+            logger = get_session_logger(session_id)
+            if logger:
+                if lvl == 'ERROR' or lvl == 'CRITICAL':
+                    logger.error(line)
+                else:
+                    logger.info(line)
+        except Exception:
+            pass
+
+    # also send to websocket clients
+    event = {"type": "log", "ts": ts, "text": message, "level": level}
+    if meta:
+        event["meta"] = meta
+    send_ws_event(session_id, event)
+
+
+def append_log(session_id: str, line: str) -> None:
+    # backward-compatible wrapper used throughout the codebase
+    structured_log(session_id, "info", line)
 
 # -------------------------
 # Scanning and session creation
@@ -227,7 +304,7 @@ def create_session(source_folder: str, folder_mappings: Dict[str, List[str]], co
     session_files_file = os.path.join(SESSIONS_DIR, f"{session_id}-files.json")
     write_json_atomic(session_file, session_meta)
     write_json_atomic(session_files_file, files)
-    append_log(session_id, "Session created")
+    structured_log(session_id, "info", "Session created", {"file_count": len(files), "photos": session_meta["summary"]["photos_count"]})
     return session_meta
 
 # -------------------------
@@ -254,10 +331,29 @@ def send_ws_event(session_id: str, event: Dict[str, Any]):
 # Wave 1 worker
 # -------------------------
 def wave1_worker(session_id: str):
+    try:
+        # wrap entire worker in try/except to capture unexpected errors
+        _wave1_worker_impl(session_id)
+    except Exception as e:
+        # log unhandled exceptions to session log
+        structured_log(session_id, "error", f"Unhandled exception in worker: {str(e)}", {"trace": traceback.format_exc()})
+        # also update session status
+        try:
+            session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
+            if os.path.exists(session_file):
+                meta = read_json_file(session_file) or {}
+                meta["status"] = "error"
+                write_json_atomic(session_file, meta)
+        except Exception:
+            pass
+    return
+
+
+def _wave1_worker_impl(session_id: str):
     session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
     session_files_file = os.path.join(SESSIONS_DIR, f"{session_id}-files.json")
     if not os.path.exists(session_file) or not os.path.exists(session_files_file):
-        append_log(session_id, "Session files missing, aborting")
+        structured_log(session_id, "error", "Session files missing, aborting")
         return
     session_meta = read_json_file(session_file)
     files = read_json_file(session_files_file)
@@ -265,11 +361,11 @@ def wave1_worker(session_id: str):
     folder_mappings = session_meta.get("folder_mappings", {}) or {}
     cfg = session_meta.get("config", DEFAULT_CONFIG)
     any_mapping = any(folder_mappings.get(k) for k in folder_mappings)
-    append_log(session_id, f"Wave 1 starting. any_mapping={any_mapping}")
+    structured_log(session_id, "info", "Wave 1 worker started", {"any_mapping": bool(any_mapping), "total_files": len(files)})
 
     # If no mapping provided anywhere, auto-complete wave1
     if not any_mapping:
-        append_log(session_id, "No custom tags provided for any folders. Wave 1 auto-completes.")
+        structured_log(session_id, "info", "No custom tags provided for any folders. Wave 1 auto-completes.")
         all_new_tags = []
         for f in files:
             if f["is_photo"]:
@@ -282,7 +378,7 @@ def wave1_worker(session_id: str):
         session_meta["status"] = "wave1_completed"
         write_json_atomic(session_file, session_meta)
         send_ws_event(session_id, {"type":"wave_complete", "wave":"wave1"})
-        append_log(session_id, "Wave 1 auto-complete done")
+        structured_log(session_id, "info", "Wave 1 auto-complete done")
         return
 
     # Group files by folder for batch processing
@@ -336,6 +432,8 @@ def wave1_worker(session_id: str):
         # Get existing tags for all files in batch
         folder_total = len(folder_batch)
         folder_processed = 0
+        # log folder start and send initial progress
+        structured_log(session_id, "info", "Processing folder", {"folder": folder, "total": folder_total})
         send_ws_event(session_id, {
             "type": "folder_progress",
             "folder": folder,
@@ -348,7 +446,7 @@ def wave1_worker(session_id: str):
             # Check if we should stop
             session_meta = read_json_file(session_file)
             if session_meta.get("status") == "stopped":
-                append_log(session_id, "Stop requested, ending processing")
+                structured_log(session_id, "info", "Stop requested, ending processing")
                 return
 
             try:
@@ -356,7 +454,7 @@ def wave1_worker(session_id: str):
             except Exception as e:
                 err = f"Failed reading keywords for {f['path']}: {str(e)}"
                 f["errors"].append(err)
-                append_log(session_id, err)
+                structured_log(session_id, "error", "Failed reading keywords for file", {"path": f["path"], "err": str(e)})
                 continue
 
             existing_norm = [normalize_tag(x) for x in existing if x and normalize_tag(x)]
@@ -366,11 +464,11 @@ def wave1_worker(session_id: str):
             if set(merged) != set(existing_norm):
                 try:
                     run_exiftool_write_keywords(f["path"], merged)
-                    append_log(session_id, f"Updated tags for {f['path']}")
+                    structured_log(session_id, "info", "Updated tags for file", {"path": f["path"]})
                 except Exception as e:
                     err = f"Failed writing keywords for {f['path']}: {str(e)}"
                     f["errors"].append(err)
-                    append_log(session_id, err)
+                    structured_log(session_id, "error", "Failed writing keywords for file", {"path": f["path"], "err": str(e)})
                     continue
 
             f["iptc_keywords_before"] = existing_norm
@@ -382,6 +480,12 @@ def wave1_worker(session_id: str):
             
             folder_processed += 1
             processed_files += 1
+
+            # log per-file processed (this helps ensure the session log records progress)
+            try:
+                structured_log(session_id, "info", "File processed", {"path": f.get("path"), "folder": folder, "folder_processed": folder_processed, "processed_total": processed_files})
+            except Exception:
+                pass
             
             # Update progress
             send_ws_event(session_id, {
@@ -394,6 +498,8 @@ def wave1_worker(session_id: str):
 
         # Save progress after each folder
         write_json_atomic(session_files_file, files)
+    # Folder complete summary
+    structured_log(session_id, "info", "Folder complete", {"folder": folder, "processed": folder_processed, "total": folder_total})
 
     # Update global tags
     update_global_tags(all_new_tags)
@@ -401,7 +507,7 @@ def wave1_worker(session_id: str):
     # Mark session completed
     session_meta["status"] = "wave1_completed"
     write_json_atomic(session_file, session_meta)
-    append_log(session_id, f"Wave 1 complete. Total processed={processed_files}/{total_files}")
+    structured_log(session_id, "info", "Wave 1 complete", {"processed": processed_files, "total": total_files})
     send_ws_event(session_id, {
         "type": "wave_complete",
         "wave": "wave1",
@@ -409,17 +515,39 @@ def wave1_worker(session_id: str):
         "total": total_files
     })
 
+
+@app.get("/api/sessions/{session_id}/log/tail")
+async def api_tail_session_log(session_id: str, lines: int = 200):
+    """Return the last N lines of the session log as plain text."""
+    path = os.path.join(LOGS_DIR, f"{session_id}.log")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="log not found")
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            all_lines = f.read().splitlines()
+            return "\n".join(all_lines[-lines:])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 def update_global_tags(new_tags: List[str]) -> None:
     data = read_json_file(TAGS_FILE) or {"tags": {}, "updated_at": None}
     counts = data.get("tags", {})
+    added = []
     for t in new_tags:
         t_norm = normalize_tag(t)
         if not t_norm:
             continue
         counts[t_norm] = counts.get(t_norm, 0) + 1
+        added.append(t_norm)
     data["tags"] = counts
     data["updated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     write_json_atomic(TAGS_FILE, data)
+    if added:
+        # log summary of added tags (use first 10 as sample)
+        sample = added[:10]
+        # If running inside a session context, there's no session_id here; write to a global log file
+        # We'll add an event per-run under pseudo-session 'global' so clients/devs can inspect
+        structured_log("global", "info", "Global tags updated", {"added_count": len(added), "sample": sample})
 
 # -------------------------
 # API endpoints
@@ -472,6 +600,15 @@ async def api_get_session_files(session_id: str):
         raise HTTPException(status_code=404, detail="session files not found")
     return read_json_file(path)
 
+
+@app.get("/api/sessions/{session_id}/log")
+async def api_get_session_log(session_id: str):
+    """Return the raw text log for a session as plain text."""
+    path = os.path.join(LOGS_DIR, f"{session_id}.log")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="log not found")
+    return FileResponse(path, media_type="text/plain")
+
 @app.post("/api/sessions/{session_id}/start")
 async def api_start_session(session_id: str):
     # spawn background thread for wave1
@@ -483,7 +620,7 @@ async def api_start_session(session_id: str):
         return {"status":"already_running"}
     meta["status"] = "wave1_running"
     write_json_atomic(path, meta)
-    append_log(session_id, "Starting Wave 1 worker")
+    structured_log(session_id, "info", "Starting Wave 1 worker")
     thread = threading.Thread(target=wave1_worker, args=(session_id,), daemon=True)
     thread.start()
     return {"status":"started"}
@@ -497,7 +634,7 @@ async def api_stop_session(session_id: str):
     meta = read_json_file(path)
     meta["status"] = "stopped"
     write_json_atomic(path, meta)
-    append_log(session_id, "Stop requested by user")
+    structured_log(session_id, "info", "Stop requested by user")
     return {"status":"stop_requested"}
 
 @app.get("/api/tags")
