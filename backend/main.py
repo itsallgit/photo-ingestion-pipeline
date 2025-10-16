@@ -10,7 +10,7 @@ import subprocess
 import traceback
 from typing import List, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -36,11 +36,11 @@ DEFAULT_CONFIG = {
 import logging
 
 # Globals
-session_queues: Dict[str, asyncio.Queue] = {}
+session_queues = {}  # type: Dict[str, asyncio.Queue]
 EVENT_LOOP = None
 
 # per-session logger cache
-session_loggers: Dict[str, logging.Logger] = {}
+session_loggers = {}  # type: Dict[str, logging.Logger]
 app = FastAPI(title="Photo Ingestion Pipeline - Wave 1 (MVP)")
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +64,8 @@ async def startup_event():
     # create tags.json if missing
     if not os.path.exists(TAGS_FILE):
         with open(TAGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"tags": {}, "updated_at": datetime.datetime.utcnow().isoformat()+"Z"}, f)
+            # use a simple list of tags (deduped) rather than counts
+            json.dump({"tags": [], "updated_at": datetime.datetime.utcnow().isoformat()+"Z"}, f)
 
 # -------------------------
 # Utility functions
@@ -95,10 +96,12 @@ def is_photo(path: str) -> bool:
     _, ext = os.path.splitext(path.lower())
     return ext in PHOTO_EXTS
 
-def run_exiftool_read_keywords(path: str) -> List[str]:
+def run_exiftool_read_keywords(path: str, session_id: str = None) -> List[str]:
     # uses exiftool -j -Keywords file
+    cmd = ["exiftool", "-j", "-Keywords", path]
     try:
-        res = subprocess.run(["exiftool", "-j", "-Keywords", path], capture_output=True, text=True, check=True)
+        structured_log(session_id or "global", "info", "Running exiftool read", {"cmd": cmd, "path": path})
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except FileNotFoundError:
         raise RuntimeError("exiftool not found in PATH. Please install exiftool.")
     except subprocess.CalledProcessError as e:
@@ -122,6 +125,116 @@ def run_exiftool_read_keywords(path: str) -> List[str]:
         return []
     return []
 
+
+def run_exiftool_read_keywords_batch(paths: List[str], session_id: str = None) -> Dict[str, List[str]]:
+    """Read Keywords for multiple files in one exiftool invocation. Returns mapping path -> keywords list."""
+    if not paths:
+        return {}
+    cmd = ["exiftool", "-j", "-Keywords"] + paths
+    try:
+        # log the command
+        structured_log(session_id or "global", "info", "Running exiftool read batch", {"cmd": cmd, "count": len(paths)})
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        raise RuntimeError("exiftool not found in PATH. Please install exiftool.")
+    except subprocess.CalledProcessError as e:
+        # Try to parse stdout even on non-zero exit
+        res = e
+    out = (res.stdout or "").strip()
+    if not out:
+        return {p: [] for p in paths}
+    try:
+        data = json.loads(out)
+        result = {}
+        if isinstance(data, list):
+            for item in data:
+                file = item.get('SourceFile') or item.get('FileName')
+                kw = item.get('Keywords')
+                if kw is None:
+                    kws = []
+                elif isinstance(kw, list):
+                    kws = [str(x) for x in kw]
+                else:
+                    kws = [str(kw)]
+                # exiftool returns filename only; attempt to match to absolute path
+                # we'll map by filename fallback
+                if file and os.path.isabs(file):
+                    key = file
+                else:
+                    # find path that endswith file
+                    matches = [p for p in paths if os.path.basename(p) == file]
+                    key = matches[0] if matches else None
+                if key:
+                    result[key] = kws
+        # ensure all paths present
+        for p in paths:
+            result.setdefault(p, [])
+        return result
+    except Exception:
+        return {p: [] for p in paths}
+
+
+def run_exiftool_write_keywords_batch(paths: List[str], keywords: List[str], session_id: str = None) -> None:
+    """Write the same set of Keywords to multiple files in one exiftool invocation.
+
+    This uses -overwrite_original and multiple -Keywords= entries, one exiftool call.
+    Logs the command executed.
+    """
+    if not paths:
+        return
+    if not keywords:
+        # clear keywords on all files
+        cmd = ["exiftool", "-overwrite_original"]
+        for p in paths:
+            cmd.append(f"-Keywords=")
+        cmd += paths
+    else:
+        cmd = ["exiftool", "-overwrite_original"]
+        for k in keywords:
+            cmd.append(f"-Keywords={k}")
+        cmd += paths
+    try:
+        structured_log(session_id or "global", "info", "Running exiftool write batch", {"cmd": cmd, "count": len(paths)})
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("exiftool not found in PATH. Please install exiftool.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"exiftool failed: {e.stderr or e.stdout}")
+
+
+def run_exiftool_write_keywords_to_folder(folder_path: str, keywords: List[str], session_id: str = None, recursive: bool = False) -> None:
+    """Write Keywords to files in a folder using exiftool.
+
+    This function uses exiftool's own recursion option (-r) when `recursive` is True.
+    It performs additive writes using -Keywords+= to avoid wiping existing tags.
+    No custom recursion traversal is implemented here; exiftool handles recursion.
+    """
+    if not os.path.isdir(folder_path):
+        raise RuntimeError(f"folder not found: {folder_path}")
+    # Only apply to known photo extensions to avoid touching unrelated files in the folder
+    exts = [e.lstrip('.') for e in PHOTO_EXTS]
+    if not keywords:
+        # If no keywords, do nothing (do not clear keywords) — additive behavior preferred
+        structured_log(session_id or "global", "info", "No keywords provided for folder write, skipping", {"folder": folder_path})
+        return
+    # build an additive write command (non-recursive): -Keywords+= will add keywords to files in the folder
+    cmd = ["exiftool", "-overwrite_original"]
+    if recursive:
+        cmd.append("-r")
+    for k in keywords:
+        cmd.append(f"-Keywords+={k}")
+    # add extension filters
+    for ex in exts:
+        cmd.extend(["-ext", ex])
+    cmd.append(folder_path)
+    try:
+        structured_log(session_id or "global", "info", "Running exiftool write to folder", {"cmd": cmd, "folder": folder_path})
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("exiftool not found in PATH. Please install exiftool.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"exiftool failed: {e.stderr or e.stdout}")
+
 def run_exiftool_write_keywords(path: str, keywords: List[str]) -> None:
     # Overwrite IPTC:Keywords with exact set
     # exiftool -overwrite_original -Keywords="a" -Keywords="b" file
@@ -135,6 +248,7 @@ def run_exiftool_write_keywords(path: str, keywords: List[str]) -> None:
             cmd.append(f"-Keywords={k}")
         cmd.append(path)
     try:
+        structured_log("global", "info", "Running exiftool write", {"cmd": cmd, "path": path})
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except FileNotFoundError:
         raise RuntimeError("exiftool not found in PATH. Please install exiftool.")
@@ -189,16 +303,14 @@ def get_session_logger(session_id: str) -> logging.Logger:
 def structured_log(session_id: str, level: str, message: str, meta: Dict[str, Any] = None) -> None:
     """Write a human-readable log line to the session file (append) and emit a websocket event.
 
-    Log line format: [ISO_TS] [LEVEL] message <meta-as-json-optional>
+    Log line format: [ISO_TS] [LEVEL] message \n<meta-as-json-optional>
     """
     ts = datetime.datetime.utcnow().isoformat() + "Z"
     lvl = (level or "info").upper()
+
+    # Single-line log format: [ISO_TS] [LEVEL] message
+    # Metadata is sent as a separate field on websocket events and not appended to the file line.
     line = f"[{ts}] [{lvl}] {message}"
-    if meta:
-        try:
-            line += " " + json.dumps(meta, ensure_ascii=False)
-        except Exception:
-            line += " " + str(meta)
 
     # write to per-session file using simple append+flush (guaranteed)
     try:
@@ -222,7 +334,7 @@ def structured_log(session_id: str, level: str, message: str, meta: Dict[str, An
         except Exception:
             pass
 
-    # also send to websocket clients
+    # also send to websocket clients (meta is included in the event)
     event = {"type": "log", "ts": ts, "text": message, "level": level}
     if meta:
         event["meta"] = meta
@@ -231,6 +343,25 @@ def structured_log(session_id: str, level: str, message: str, meta: Dict[str, An
 
 def append_log(session_id: str, line: str) -> None:
     # backward-compatible wrapper used throughout the codebase
+    # If the line contains a trailing JSON object (common in older code paths),
+    # extract it and pass it as meta so the human-readable message stays clean.
+    if not line:
+        structured_log(session_id, "info", "", None)
+        return
+    try:
+        import re
+        m = re.match(r'^(.*)\s(\{.*\})\s*$', line)
+        if m:
+            msg = m.group(1).strip()
+            meta_raw = m.group(2)
+            try:
+                meta = json.loads(meta_raw)
+            except Exception:
+                meta = meta_raw
+            structured_log(session_id, "info", msg, meta)
+            return
+    except Exception:
+        pass
     structured_log(session_id, "info", line)
 
 # -------------------------
@@ -319,13 +450,46 @@ def ensure_queue(session_id: str) -> asyncio.Queue:
 
 def send_ws_event(session_id: str, event: Dict[str, Any]):
     # Put event into the asyncio queue for the session
+    global EVENT_LOOP
     if EVENT_LOOP is None:
+        # try to recover a running loop reference if possible
+        try:
+            EVENT_LOOP = asyncio.get_running_loop()
+        except Exception:
+            try:
+                EVENT_LOOP = asyncio.get_event_loop()
+            except Exception:
+                EVENT_LOOP = None
+    if EVENT_LOOP is None:
+        # log missing event loop for debugging directly to file to avoid recursion
+        try:
+            logger = get_session_logger(session_id)
+            if logger:
+                logger.error(f"[EVENT_LOOP MISSING] cannot send ws event {event.get('type')}")
+        except Exception:
+            pass
         return
     q = ensure_queue(session_id)
     try:
+        # write a safe file-only log entry (do not call structured_log -> would send ws event)
+        try:
+            logger = get_session_logger(session_id)
+            if logger:
+                logger.info(f">>> Event: Queueing - {event.get('type')}")
+        except Exception:
+            pass
         asyncio.run_coroutine_threadsafe(q.put(event), EVENT_LOOP)
+        try:
+            logger = get_session_logger(session_id)
+        except Exception:
+            pass
     except Exception:
-        pass
+        try:
+            logger = get_session_logger(session_id)
+            if logger:
+                logger.error(f">>> Event: Failed to queue - {event}")
+        except Exception:
+            pass
 
 # -------------------------
 # Wave 1 worker
@@ -336,7 +500,7 @@ def wave1_worker(session_id: str):
         _wave1_worker_impl(session_id)
     except Exception as e:
         # log unhandled exceptions to session log
-        structured_log(session_id, "error", f"Unhandled exception in worker: {str(e)}", {"trace": traceback.format_exc()})
+        structured_log(session_id, "error", "Unhandled exception in worker", {"err": str(e), "trace": traceback.format_exc()})
         # also update session status
         try:
             session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
@@ -353,7 +517,7 @@ def _wave1_worker_impl(session_id: str):
     session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
     session_files_file = os.path.join(SESSIONS_DIR, f"{session_id}-files.json")
     if not os.path.exists(session_file) or not os.path.exists(session_files_file):
-        structured_log(session_id, "error", "Session files missing, aborting")
+        structured_log(session_id, "error", "Session files missing, aborting", {"session_file": session_file, "session_files_file": session_files_file})
         return
     session_meta = read_json_file(session_file)
     files = read_json_file(session_files_file)
@@ -377,6 +541,10 @@ def _wave1_worker_impl(session_id: str):
         update_global_tags([])
         session_meta["status"] = "wave1_completed"
         write_json_atomic(session_file, session_meta)
+        # emit folder Completed for all folders so frontend reflects final state
+        rels = set([f.get("rel_dir", "") for f in files])
+        for r in rels:
+            send_ws_event(session_id, {"type": "folder_status", "folder": r, "status": "Completed"})
         send_ws_event(session_id, {"type":"wave_complete", "wave":"wave1"})
         structured_log(session_id, "info", "Wave 1 auto-complete done")
         return
@@ -395,6 +563,10 @@ def _wave1_worker_impl(session_id: str):
     all_new_tags = []
     total_files = sum(len(files) for files in folder_files.values())
     processed_files = 0
+
+    # Emit initial Pending status for each folder so frontend shows Pending state
+    for folder in folder_files.keys():
+        send_ws_event(session_id, {"type": "folder_status", "folder": folder, "status": "Pending"})
 
     for folder, folder_batch in folder_files.items():
         # Skip folders without mappings
@@ -421,99 +593,102 @@ def _wave1_worker_impl(session_id: str):
         tags_norm = [normalize_tag(t) for t in tags if t and normalize_tag(t)]
         
         if not tags_norm:
-            # No tags for this folder, mark all files complete
+            # No tags for this folder, mark all files complete and emit Completed status
             for f in folder_batch:
                 if "wave1" not in f["waves_completed"]:
                     f["waves_completed"].append("wave1")
                     f["last_processed"] = datetime.datetime.utcnow().isoformat() + "Z"
                 processed_files += 1
+            write_json_atomic(session_files_file, files)
+            structured_log(session_id, "info", "Folder skipped (no tags)", {"folder": folder, "total": len(folder_batch), "status": "Completed"})
+            send_ws_event(session_id, {"type": "folder_status", "folder": folder, "status": "Completed"})
             continue
 
-        # Get existing tags for all files in batch
+        # Write tags for the entire folder in one exiftool call (no per-file read)
         folder_total = len(folder_batch)
-        folder_processed = 0
-        # log folder start and send initial progress
-        structured_log(session_id, "info", "Processing folder", {"folder": folder, "total": folder_total})
-        send_ws_event(session_id, {
-            "type": "folder_progress",
-            "folder": folder,
-            "total": folder_total,
-            "processed": folder_processed
-        })
+        # folder path on disk: join source_folder and rel dir
+        folder_full = os.path.join(source_folder, folder) if folder else source_folder
 
-        # Process batch
+        structured_log(session_id, "info", "Processing folder (additive recursive)", {"folder": folder, "total": folder_total, "status": "Processing", "tags": tags_norm})
+        send_ws_event(session_id, {"type": "folder_status", "folder": folder, "status": "Processing"})
+
+        # Perform one additive write for the folder. Allow exiftool to recurse when configured.
+        recursive_flag = bool(cfg.get("recursive_folder_writes", False))
+        try:
+            run_exiftool_write_keywords_to_folder(folder_full, tags_norm, session_id=session_id, recursive=recursive_flag)
+            structured_log(session_id, "info", "Ran exiftool folder write (additive)", {"folder": folder, "tags": tags_norm, "recursive": recursive_flag})
+        except Exception as e:
+            structured_log(session_id, "error", "Failed writing keywords for folder", {"folder": folder, "err": str(e)})
+
+        # Update file metadata after writes. We no longer pre-read per-file keywords; just record that the wave completed
         for f in folder_batch:
-            # Check if we should stop
-            session_meta = read_json_file(session_file)
-            if session_meta.get("status") == "stopped":
-                structured_log(session_id, "info", "Stop requested, ending processing")
-                return
-
-            try:
-                existing = run_exiftool_read_keywords(f["path"])
-            except Exception as e:
-                err = f"Failed reading keywords for {f['path']}: {str(e)}"
-                f["errors"].append(err)
-                structured_log(session_id, "error", "Failed reading keywords for file", {"path": f["path"], "err": str(e)})
-                continue
-
-            existing_norm = [normalize_tag(x) for x in existing if x and normalize_tag(x)]
-            new_tags = [t for t in tags_norm if t not in existing_norm]
-            merged = sorted(set(existing_norm + new_tags))
-
-            if set(merged) != set(existing_norm):
-                try:
-                    run_exiftool_write_keywords(f["path"], merged)
-                    structured_log(session_id, "info", "Updated tags for file", {"path": f["path"]})
-                except Exception as e:
-                    err = f"Failed writing keywords for {f['path']}: {str(e)}"
-                    f["errors"].append(err)
-                    structured_log(session_id, "error", "Failed writing keywords for file", {"path": f["path"], "err": str(e)})
-                    continue
-
-            f["iptc_keywords_before"] = existing_norm
-            f["iptc_keywords_after"] = merged
+            # iptc_keywords_before is not populated to avoid extra reads; leave as-is or empty
+            f["iptc_keywords_before"] = f.get("iptc_keywords_before", [])
+            # iptc_keywords_after will be updated conservatively as tags_norm merged with existing placeholder
+            # to reflect intended new state without forcing a read
+            after = list(sorted(set([normalize_tag(x) for x in (f.get("iptc_keywords_before", []) or [])] + tags_norm)))
+            f["iptc_keywords_after"] = after
             if "wave1" not in f["waves_completed"]:
                 f["waves_completed"].append("wave1")
             f["last_processed"] = datetime.datetime.utcnow().isoformat() + "Z"
-            all_new_tags.extend(new_tags)
-            
-            folder_processed += 1
-            processed_files += 1
-
-            # log per-file processed (this helps ensure the session log records progress)
-            try:
-                structured_log(session_id, "info", "File processed", {"path": f.get("path"), "folder": folder, "folder_processed": folder_processed, "processed_total": processed_files})
-            except Exception:
-                pass
-            
-            # Update progress
-            send_ws_event(session_id, {
-                "type": "folder_progress",
-                "folder": folder,
-                "total": folder_total,
-                "processed": folder_processed,
-                "complete": folder_processed >= folder_total
-            })
+            # collect new tags for global update (we'll dedupe globally later)
+            all_new_tags.extend(tags_norm)
 
         # Save progress after each folder
         write_json_atomic(session_files_file, files)
-    # Folder complete summary
-    structured_log(session_id, "info", "Folder complete", {"folder": folder, "processed": folder_processed, "total": folder_total})
+
+        # increment processed_files by folder_total
+        processed_files += folder_total
+
+        # Mark folder completed and emit Completed status so frontend can update folder row immediately
+        structured_log(session_id, "info", "Folder complete", {"folder": folder, "processed": folder_total, "status": "Completed"})
+        send_ws_event(session_id, {"type": "folder_status", "folder": folder, "status": "Completed"})
+    # Overall summary for wave1
+    structured_log(session_id, "info", "Wave 1 folder processing complete", {"processed": processed_files, "total": total_files})
 
     # Update global tags
-    update_global_tags(all_new_tags)
+    try:
+        update_global_tags(all_new_tags)
+        structured_log(session_id, "info", "Global tags updated after wave1", {"added_count": len(all_new_tags)})
+    except Exception as e:
+        structured_log(session_id, "error", "Failed updating global tags", {"err": str(e), "trace": traceback.format_exc()})
 
     # Mark session completed
-    session_meta["status"] = "wave1_completed"
-    write_json_atomic(session_file, session_meta)
-    structured_log(session_id, "info", "Wave 1 complete", {"processed": processed_files, "total": total_files})
-    send_ws_event(session_id, {
-        "type": "wave_complete",
-        "wave": "wave1",
-        "processed": processed_files,
-        "total": total_files
-    })
+    try:
+        session_meta["status"] = "wave1_completed"
+        write_json_atomic(session_file, session_meta)
+        structured_log(session_id, "info", "Wave 1 complete", {"processed": processed_files, "total": total_files})
+    except Exception as e:
+        structured_log(session_id, "error", "Failed writing session meta at completion", {"err": str(e), "trace": traceback.format_exc()})
+
+    # Send final websocket events (ensure every folder gets an explicit Completed event, then wave_complete and session_meta)
+    try:
+        # Ensure every folder from the session folder_mappings is marked Completed so UI can't miss root or other folders
+        try:
+            fm = session_meta.get('folder_mappings', {}) or {}
+            for folder in fm.keys():
+                send_ws_event(session_id, {"type": "folder_status", "folder": folder, "status": "Completed"})
+            structured_log(session_id, "info", "Emitted final folder_status=Completed for all folders", {"folders": list(fm.keys())})
+        except Exception as _:
+            # non-fatal: continue to send wave_complete/session_meta
+            structured_log(session_id, "warning", "Failed emitting final folder_status events", {"err": str(_)} )
+        send_ws_event(session_id, {
+            "type": "wave_complete",
+            "wave": "wave1",
+            "processed": processed_files,
+            "total": total_files
+        })
+        structured_log(session_id, "info", "Sent wave_complete event", {"processed": processed_files, "total": total_files})
+    except Exception as e:
+        structured_log(session_id, "error", "Failed sending wave_complete event", {"err": str(e), "trace": traceback.format_exc()})
+
+    try:
+        send_ws_event(session_id, {"type": "session_meta", "meta": session_meta})
+        structured_log(session_id, "info", "Sent session_meta event", {"session_id": session_meta.get("session_id")} )
+    except Exception as e:
+        structured_log(session_id, "error", "Failed sending session_meta event", {"err": str(e), "trace": traceback.format_exc()})
+
+    structured_log(session_id, "info", "Wave 1 finished - worker exiting", {})
 
 
 @app.get("/api/sessions/{session_id}/log/tail")
@@ -530,23 +705,21 @@ async def api_tail_session_log(session_id: str, lines: int = 200):
         raise HTTPException(status_code=500, detail=str(e))
 
 def update_global_tags(new_tags: List[str]) -> None:
-    data = read_json_file(TAGS_FILE) or {"tags": {}, "updated_at": None}
-    counts = data.get("tags", {})
+    data = read_json_file(TAGS_FILE) or {"tags": [], "updated_at": None}
+    existing = set(data.get("tags", []) or [])
     added = []
     for t in new_tags:
         t_norm = normalize_tag(t)
         if not t_norm:
             continue
-        counts[t_norm] = counts.get(t_norm, 0) + 1
-        added.append(t_norm)
-    data["tags"] = counts
+        if t_norm not in existing:
+            existing.add(t_norm)
+            added.append(t_norm)
+    data["tags"] = sorted(existing)
     data["updated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     write_json_atomic(TAGS_FILE, data)
     if added:
-        # log summary of added tags (use first 10 as sample)
         sample = added[:10]
-        # If running inside a session context, there's no session_id here; write to a global log file
-        # We'll add an event per-run under pseudo-session 'global' so clients/devs can inspect
         structured_log("global", "info", "Global tags updated", {"added_count": len(added), "sample": sample})
 
 # -------------------------
@@ -584,7 +757,7 @@ async def api_list_sessions():
             except Exception:
                 continue
     items = sorted(items, key=lambda x: x.get("created_at", ""), reverse=True)
-    return items
+    return JSONResponse(content=items)
 
 @app.get("/api/sessions/{session_id}")
 async def api_get_session(session_id: str):
@@ -607,7 +780,13 @@ async def api_get_session_log(session_id: str):
     path = os.path.join(LOGS_DIR, f"{session_id}.log")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="log not found")
-    return FileResponse(path, media_type="text/plain")
+    try:
+        # read the full file into memory and return as plain text to ensure Content-Length is correct
+        with open(path, 'r', encoding='utf-8') as f:
+            data = f.read()
+        return PlainTextResponse(content=data, media_type='text/plain')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sessions/{session_id}/start")
 async def api_start_session(session_id: str):
@@ -640,21 +819,69 @@ async def api_stop_session(session_id: str):
 @app.get("/api/tags")
 async def api_get_tags():
     data = read_json_file(TAGS_FILE)
-    return data or {"tags": {}, "updated_at": None}
+    return JSONResponse(content=(data or {"tags": [], "updated_at": None}))
 
 # Websocket for session events
 @app.websocket("/api/sessions/{session_id}/ws")
 async def session_ws(websocket: WebSocket, session_id: str):
+    # Capture the running event loop for thread-safe queuing from background workers
+    global EVENT_LOOP
+    try:
+        EVENT_LOOP = asyncio.get_running_loop()
+    except Exception:
+        try:
+            EVENT_LOOP = asyncio.get_event_loop()
+        except Exception:
+            EVENT_LOOP = None
     await websocket.accept()
     q = ensure_queue(session_id)
     try:
+        logger = None
+        try:
+            logger = get_session_logger(session_id)
+        except Exception:
+            logger = None
         while True:
             event = await q.get()
+            # Write a file-only diagnostic that we're about to send this event
             try:
-                await websocket.send_json(event)
+                if logger:
+                    logger.info(f">>> WS sending event: {event.get('type')}")
             except Exception:
                 pass
+            try:
+                await websocket.send_json(event)
+                try:
+                    if logger:
+                        logger.info(f">>> WS sent event: {event.get('type')}")
+                except Exception:
+                    pass
+            except WebSocketDisconnect:
+                try:
+                    if logger:
+                        logger.info('>>> WS disconnected by client')
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                try:
+                    if logger:
+                        logger.error(f">>> WS send failed: {e}")
+                except Exception:
+                    pass
+                # on failure, attempt to close websocket and exit
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+                return
     except WebSocketDisconnect:
+        try:
+            logger = get_session_logger(session_id)
+            if logger:
+                logger.info('>>> WS disconnected')
+        except Exception:
+            pass
         return
 
 # Serve index.html directly for root

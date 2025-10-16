@@ -37,7 +37,7 @@ mkdir INGESTION_TARGET
 
 ```bash
 # Build and start the service (maps ./data on host to /app/data and ./INGESTION_TARGET to /app/INGESTION_TARGET in container)
-docker-compose -f docker/docker-compose.yml up --build
+docker-compose -f docker/docker-compose.yml up --build -d photo-ingestion-pipeline
 ```
 
 3. Open your browser to `http://localhost:8000`. The web UI will be served from the FastAPI app.

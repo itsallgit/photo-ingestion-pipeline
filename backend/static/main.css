@@ -207,6 +207,13 @@ button:disabled {
   line-height: 1;
   padding-bottom: 6px;
 }
+
+/* lighter chip variant for global tags */
+.chip-light {
+  background: rgba(251,133,0,0.08); /* very transparent orange */
+  color: var(--color-accent2);
+  border: 1px solid rgba(251,133,0,0.14);
+}
 .chip-remove {
   font-weight: bold;
   cursor: pointer;
@@ -235,10 +242,14 @@ button:disabled {
   border-radius: 8px;
   padding: 12px;
 }
-
 .wave1-table { 
   width: 100%; 
   border-collapse: collapse; 
+}
+.wave1-table.rounded {
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
 }
 .wave1-table th, .wave1-table td { 
   padding: 8px; 
@@ -263,7 +274,8 @@ button:disabled {
   color: #fff;
 }
 .pill-complete { background: var(--color-accent2); }
-.pill-working { background: var(--color-accent1); }
+.pill-working { background: var(--color-accent1); color: #000; }
+.pill-pending { background: #e9ecef; color: #6b7280; }
 
 /* =========================================
    Log Viewer
@@ -277,3 +289,68 @@ pre.log {
   overflow: auto;
   white-space: pre-wrap;
 }
+
+/* Log table styles */
+.log-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.log-table th, .log-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #f1f1f1;
+  vertical-align: top;
+  font-family: monospace;
+  text-align: start;
+}
+.log-ts { width: 1%; min-width: 160px; color: var(--color-muted); font-size: 0.85em; white-space: nowrap; }
+.log-level { width: 90px; text-transform: uppercase; font-weight: 600; }
+.log-msg { width: auto; }
+.log-meta { width: 120px; max-width: 120px; white-space: nowrap; }
+.log-meta td, .log-meta th { overflow: hidden; text-overflow: ellipsis; }
+.meta-toggle { color: var(--color-primary); cursor: pointer; font-size: 0.85em; }
+.meta-content { background: #fafafa; border-left: 3px solid rgba(0,0,0,0.06); padding: 8px; font-family: monospace; font-size: 0.9em; display: none; }
+.meta-content.open { display: block; }
+
+/* Session header and control row */
+.control-row { display:flex; align-items:center; justify-content:flex-start; }
+
+/* Global tags container */
+.global-tags { display:flex; flex-wrap:wrap; gap:6px; }
+
+/* Additional UI tweaks added by recent patch */
+.control-left { display:flex; align-items:center; }
+.control-right { margin-left:auto; display:flex; align-items:center; }
+.log-table-wrap { max-height: 340px; overflow: auto; width: 100%; }
+.level-pill { display:inline-block; padding:3px 8px; border-radius:999px; background: rgba(0,0,0,0.04); color: #222; font-size:0.85em; }
+.meta-toggle { color: var(--color-primary); cursor: pointer; font-size: 0.85em; margin-right: 8px; }
+.meta-inline { color: var(--color-primary); font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 36ch; display: inline-block; vertical-align: middle; text-decoration: underline; cursor: pointer; }
+.meta-content { background: #fafafa; border-left: 3px solid rgba(0,0,0,0.06); padding: 8px; font-family: monospace; font-size: 0.9em; white-space: pre-wrap; overflow: auto; }
+
+/* Anchor export button bottom-left in the Global Tags card */
+.card.flex-1 { position: relative; }
+.card.flex-1 > .export-box { position: absolute; left: 12px; bottom: 12px; }
+.export-box button { padding: 6px 10px; }
+
+/* Modal for metadata */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1200;
+}
+.modal {
+  background: #fff;
+  border-radius: 8px;
+  width: 85%;
+  max-width: 980px;
+  max-height: 80vh;
+  overflow: auto;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.25);
+  padding: 12px;
+}
+.modal-header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.modal-body { padding-top: 8px; }
+.meta-content { background: #0f1724; color: #e6eef8; padding: 12px; border-radius: 6px; overflow: auto; white-space: pre-wrap; }
